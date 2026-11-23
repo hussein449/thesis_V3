@@ -1,0 +1,287 @@
+/**
+ * UAV Patrol Segmentation — §6 of the Simplified UAV-IoT Model
+ * ============================================================
+ *
+ * Two modes:
+ *
+ *   §6.1  Uniform patrol — divide the corridor of length L into M equal
+ *         segments. Each UAV gets the same road length:
+ *           A_m = (m-1) · L / M     B_m = m · L / M
+ *
+ *   §6.2  Risk-aware patrol — group the 1-km highway sections so each UAV
+ *         segment carries roughly equal cumulative risk. Per-section risk is
+ *         the section's EXPECTED CRASHES PER DAY, summed over the five slots:
+ *           R_i = Σ_b λ_{i,b}  where  λ_{i,b} = rate_{i,b} · length_i · h_b
+ *         Greedy left-to-right walk: keep adding sections to the current
+ *         UAV segment until its cumulative risk reaches totalRisk / M;
+ *         then start a new segment. The boundary section is included or
+ *         excluded based on whichever side is closer to the target.
+ *
+ *         This used to be a flat mean of the five unitless slot scores,
+ *         (1/B)·Σ_b R_{i,b}. Two problems that fixes: the slots are 6, 4, 6,
+ *         4 and 4 hours long, so a flat mean over-weighted the two long
+ *         low-risk slots; and a mean of per-km rates ignores section length,
+ *         which matters for the short final section. Expected crashes per day
+ *         handles both, and is what "equal cumulative risk" should mean —
+ *         each UAV responsible for the same number of crashes per day.
+ *
+ * Both return arrays of { index, A, B, length } in METERS along the
+ * corridor — same units the detection sim uses. Risk-aware segments
+ * additionally carry { sectionStart, sectionEnd, riskTotal, riskAverage }.
+ *
+ * Note: UAV patrol segments [A_m, B_m] are distinct from the 1-km highway
+ * sections S_i defined by sections.js. A patrol segment groups one or more
+ * adjacent highway sections; sections are the unit of risk scoring and
+ * accident generation, segments are the unit of UAV assignment.
+ *
+ * §6.3 adds a third strategy, CCR-UAV, which lives in ccr-uav.js because it
+ * optimises on its own 100 m grid instead of the 1 km sections the other two
+ * use. It is reached through buildPatrolSegments() like the others.
+ */
+
+import { buildCcrSegments } from './ccr-uav'
+
+/**
+ * §6.1 — Equal-length patrol segmentation.
+ * Divides [0, corridorLengthM] into M segments, each of length L/M. Each
+ * segment gets exactly one drone (droneCount = 1) — Uniform never
+ * stacks; that's its definitional "no-info" property.
+ */
+export function buildUniformSegments(corridorLengthM, M) {
+  if (corridorLengthM <= 0) throw new Error('corridorLengthM must be positive')
+  if (!Number.isInteger(M) || M < 1) throw new Error('M must be a positive integer')
+  const segLen = corridorLengthM / M
+  const segments = []
+  for (let m = 1; m <= M; m++) {
+    segments.push({
+      index: m,
+      A: (m - 1) * segLen,
+      B: m * segLen,
+      length: segLen,
+      droneCount: 1,
+    })
+  }
+  return segments
+}
+
+/**
+ * §6.2 — Equal-cumulative-risk patrol segmentation with stacking.
+ *
+ *   sections     — output of buildSections(road.lengthKm) [{ index, sStart, sEnd, ... }]
+ *                  sStart / sEnd are in km.
+ *   riskMatrix   — output of buildRiskMatrix(road) — each row has a
+ *                  `lambdaDay` array of length B holding the section's
+ *                  expected crashes per day in each time slot.
+ *   M            — total number of drones to deploy on this road.
+ *
+ * Two-stage allocation:
+ *   1. Build up to min(M, N_sections) BASE segments using the existing
+ *      greedy equal-cumulative-risk walk, target = totalRisk / effectiveM.
+ *      Each base segment is guaranteed at least one drone.
+ *   2. If M > N_sections (i.e. we have more drones than sections), the
+ *      EXCESS (M - N_sections) drones are distributed across the 28 base
+ *      segments by Hamilton's largest-remainder method, weighted by each
+ *      segment's mean risk. Hot-spot segments end up with multiple drones
+ *      (droneCount > 1); low-risk segments stay at 1. Each segment's
+ *      droneCount is attached so callers can size the drone-state pool.
+ *
+ * Returns segments with the same shape as buildUniformSegments() plus
+ *   { sectionStart, sectionEnd, riskTotal, riskAverage, droneCount }
+ * where sectionStart/sectionEnd are inclusive 1-based section indices, and
+ * riskTotal / riskAverage are in EXPECTED CRASHES PER DAY — per segment and
+ * per section respectively. They were unitless scores before this model; a
+ * segment's riskTotal is now readable directly as "this UAV covers 0.09
+ * crashes a day".
+ */
+export function buildRiskAwareSegments(sections, riskMatrix, M) {
+  if (!Array.isArray(sections) || sections.length === 0) {
+    throw new Error('sections must be a non-empty array')
+  }
+  if (!Array.isArray(riskMatrix) || riskMatrix.length !== sections.length) {
+    throw new Error('riskMatrix must have one row per section')
+  }
+  if (!Number.isInteger(M) || M < 1) throw new Error('M must be a positive integer')
+  // Cap base segments so each gets at least one section.
+  const effectiveM = Math.min(M, sections.length)
+
+  // R_i — expected crashes per day in each section, over all time slots.
+  const meanRisks = riskMatrix.map((row) => {
+    if (!Array.isArray(row.lambdaDay) || row.lambdaDay.length === 0) return 0
+    return row.lambdaDay.reduce((a, b) => a + b, 0)
+  })
+  const totalRisk = meanRisks.reduce((a, b) => a + b, 0)
+  const target = totalRisk / effectiveM
+
+  const segments = []
+  let curStart = 0 // 0-based section index
+  for (let m = 1; m <= effectiveM; m++) {
+    let i = curStart
+    let r = 0
+    if (m === effectiveM) {
+      // Last segment owns everything remaining.
+      i = sections.length
+      r = meanRisks.slice(curStart, i).reduce((a, b) => a + b, 0)
+    } else {
+      while (i < sections.length && r + meanRisks[i] < target) {
+        r += meanRisks[i]
+        i++
+      }
+      // Decide whether the boundary section belongs to this segment or
+      // the next: pick whichever choice gets r closer to the target.
+      if (i < sections.length) {
+        const withIt = r + meanRisks[i]
+        const without = r
+        if (Math.abs(withIt - target) <= Math.abs(without - target)) {
+          r = withIt
+          i++
+        }
+      }
+      // Ensure forward progress.
+      if (i === curStart) {
+        r += meanRisks[i] ?? 0
+        i++
+      }
+      // Leave at least one section per remaining segment.
+      const sectionsLeft = sections.length - i
+      const segmentsLeft = effectiveM - m
+      if (sectionsLeft < segmentsLeft) {
+        const give = segmentsLeft - sectionsLeft
+        for (let k = 0; k < give; k++) {
+          i--
+          r -= meanRisks[i] ?? 0
+        }
+      }
+    }
+    const A = sections[curStart].sStart * 1000
+    const B = sections[i - 1].sEnd * 1000
+    segments.push({
+      index: m,
+      A,
+      B,
+      length: B - A,
+      sectionStart: sections[curStart].index,
+      sectionEnd: sections[i - 1].index,
+      riskTotal: r,
+      riskAverage: r / (i - curStart),
+      droneCount: 1, // base allocation — overwritten below if M > effectiveM
+    })
+    curStart = i
+  }
+
+  // Stage 2 — distribute excess drones (M > effectiveM) across base
+  // segments by Hamilton's largest-remainder on riskAverage. Each
+  // segment keeps its base 1 + Hamilton-assigned extras.
+  if (M > effectiveM) {
+    const extras = M - effectiveM
+    const totalSegRisk = segments.reduce((s, x) => s + x.riskAverage, 0) || 1
+    const items = segments.map((seg, idx) => {
+      const exact = (seg.riskAverage / totalSegRisk) * extras
+      return {
+        idx,
+        exact,
+        extra: Math.floor(exact),
+        frac: exact - Math.floor(exact),
+      }
+    })
+    let remaining = extras - items.reduce((s, x) => s + x.extra, 0)
+    // Largest-remainder tie-break: higher riskAverage first if fracs are
+    // equal, so the hottest segments get the marginal drone.
+    const byFrac = [...items].sort((a, b) => {
+      if (b.frac !== a.frac) return b.frac - a.frac
+      return segments[b.idx].riskAverage - segments[a.idx].riskAverage
+    })
+    for (let k = 0; k < remaining; k++) byFrac[k].extra += 1
+    for (const it of items) {
+      segments[it.idx].droneCount = 1 + it.extra
+    }
+  }
+
+  return segments
+}
+
+/**
+ * Thrown when CCR-UAV cannot satisfy its length cap with the fleet given.
+ *
+ * §6.3 requires an infeasible configuration to be REPORTED as infeasible
+ * rather than silently relaxed: a sweep should catch this, mark that fleet
+ * size as not applicable for CCR-UAV, and keep the uniform / risk-aware
+ * results at the same point. Falling back to a relaxed partition would
+ * compare a different algorithm under the same name.
+ */
+export class CcrInfeasibleError extends Error {
+  constructor(reason, minimumFleet, M) {
+    super(
+      `CCR-UAV infeasible at M = ${M}: ${reason}. `
+      + `At least ${minimumFleet} UAVs are needed to respect the `
+      + 'segment-length cap.'
+    )
+    this.name = 'CcrInfeasibleError'
+    this.code = 'CCR_INFEASIBLE'
+    this.reason = reason
+    this.minimumFleet = minimumFleet
+    this.M = M
+  }
+}
+
+/**
+ * Top-level entry — pick uniform vs. risk-aware vs. CCR-UAV by `mode`.
+ *
+ *   mode:               'uniform' | 'risk-aware' | 'ccr'
+ *   corridorLengthM:    total road length in meters (uniform and ccr)
+ *   M:                  number of UAVs
+ *   sections:           required for 'risk-aware'
+ *   riskMatrix:         required for 'risk-aware'
+ *   ccrParams:          optional { dx, v, rIot, tMax } for 'ccr'; the caller
+ *                       should pass the simulation's own speed and detection
+ *                       window so the length cap L_max = v*T_max/2 tracks the
+ *                       settings actually being run, not the defaults.
+ *
+ * 'ccr' reads crash rates straight from the fitted rate table rather than
+ * from `sections` / `riskMatrix`, because it optimises on a 100 m grid
+ * rather than the 1 km sections the other two strategies use.
+ */
+export function buildPatrolSegments({
+  mode, corridorLengthM, M, sections, riskMatrix, ccrParams,
+}) {
+  if (mode === 'uniform') return buildUniformSegments(corridorLengthM, M)
+  if (mode === 'risk-aware' || mode === 'riskAware') {
+    return buildRiskAwareSegments(sections, riskMatrix, M)
+  }
+  if (mode === 'ccr' || mode === 'ccrUav') {
+    const { segments, ccr } = buildCcrSegments({
+      corridorLengthM, M, params: ccrParams ?? {},
+    })
+    if (!ccr.feasible) {
+      throw new CcrInfeasibleError(ccr.reason, ccr.minimumFleet, M)
+    }
+    // Carry the solver's metadata on the array so callers can reach the
+    // surrogate objective and the cap that produced it, while the array
+    // itself keeps the same shape as the other two strategies.
+    segments.ccr = ccr
+    return segments
+  }
+  throw new Error(`Unknown patrol mode: ${mode}`)
+}
+
+/**
+ * Find the 1-based patrol-segment index that contains position s (meters
+ * from corridor start). Returns -1 if s is outside every segment.
+ *
+ * Used in §10 to find the segment m of an accident position, so we can
+ * pick the candidate UAV set { m-1, m, m+1 }.
+ *
+ * Boundary convention mirrors sections.js: half-open [A, B) intervals,
+ * with the last segment closed on the right so s = corridorLength is
+ * included.
+ */
+export function patrolSegmentIndexAt(segments, s) {
+  if (segments.length === 0) return -1
+  const last = segments[segments.length - 1]
+  if (s < segments[0].A) return -1
+  if (s > last.B) return -1
+  if (s === last.B) return last.index
+  for (const seg of segments) {
+    if (s >= seg.A && s < seg.B) return seg.index
+  }
+  return -1
+}
